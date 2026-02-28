@@ -13,6 +13,7 @@ import (
 	"runtime/pprof"
 	"sort"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -31,13 +32,13 @@ import (
 
 var (
 	// Command line flags
-	flagVersion   = flag.Bool("version", false, "Show the version number and information")
-	flagConfigDir = flag.String("config-dir", "", "Specify a custom location for the configuration directory")
-	flagOptions   = flag.Bool("options", false, "Show all option help")
-	flagDebug     = flag.Bool("debug", false, "Enable debug mode (prints debug info to ./log.txt)")
-	flagProfile   = flag.Bool("profile", false, "Enable CPU profiling (writes profile info to ./micro.prof)")
-	flagPlugin    = flag.String("plugin", "", "Plugin command")
-	flagClean     = flag.Bool("clean", false, "Clean configuration directory")
+	flagVersion   *bool
+	flagConfigDir *string
+	flagOptions   *bool
+	flagDebug     *bool
+	flagProfile   *bool
+	flagPlugin    *string
+	flagClean     *bool
 	optionFlags   map[string]*string
 
 	sighup chan os.Signal
@@ -45,7 +46,53 @@ var (
 	timerChan chan func()
 )
 
+var pscalEmbeddedMode bool
+
+type pscalExitPanic struct {
+	code int
+}
+
+func pscalIsEmbeddedRuntime() bool {
+	if pscalEmbeddedMode {
+		return true
+	}
+	return os.Getenv("PSCAL_MICRO_EMBEDDED") == "1"
+}
+
+func pscalExitCodeFromRecovered(v interface{}) (int, bool) {
+	switch x := v.(type) {
+	case pscalExitPanic:
+		return x.code, true
+	case *pscalExitPanic:
+		if x != nil {
+			return x.code, true
+		}
+	}
+
+	text := strings.TrimSpace(fmt.Sprint(v))
+	if text == "" {
+		return 0, false
+	}
+	if strings.HasPrefix(text, "{") && strings.HasSuffix(text, "}") && len(text) >= 2 {
+		text = strings.TrimSpace(text[1 : len(text)-1])
+	}
+	code, err := strconv.Atoi(text)
+	if err != nil {
+		return 0, false
+	}
+	return code, true
+}
+
 func InitFlags() {
+	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+	flag.CommandLine.SetOutput(io.Discard)
+	flagVersion = flag.Bool("version", false, "Show the version number and information")
+	flagConfigDir = flag.String("config-dir", "", "Specify a custom location for the configuration directory")
+	flagOptions = flag.Bool("options", false, "Show all option help")
+	flagDebug = flag.Bool("debug", false, "Enable debug mode (prints debug info to ./log.txt)")
+	flagProfile = flag.Bool("profile", false, "Enable CPU profiling (writes profile info to ./micro.prof)")
+	flagPlugin = flag.String("plugin", "", "Plugin command")
+	flagClean = flag.Bool("clean", false, "Clean configuration directory")
 	// Note: keep this in sync with the man page in assets/packaging/micro.1
 	flag.Usage = func() {
 		fmt.Println("Usage: micro [OPTION]... [FILE]... [+LINE[:COL]] [+/REGEX]")
@@ -284,16 +331,30 @@ func exit(rc int) {
 	}
 
 	if screen.Screen != nil {
-		screen.Screen.Fini()
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Println("Warning: ignored panic during screen shutdown:", r)
+				}
+			}()
+			screen.Screen.Fini()
+		}()
+	}
+
+	if pscalIsEmbeddedRuntime() {
+		panic(pscalExitPanic{code: rc})
 	}
 
 	os.Exit(rc)
 }
 
-func main() {
+func pscalMicroMain() {
 	defer func() {
 		if util.Stdout.Len() > 0 {
 			fmt.Fprint(os.Stdout, util.Stdout.String())
+		}
+		if r := recover(); r != nil {
+			panic(r)
 		}
 		exit(0)
 	}()
@@ -318,6 +379,7 @@ func main() {
 	err = config.InitConfigDir(*flagConfigDir)
 	if err != nil {
 		screen.TermMessage(err)
+		exit(1)
 	}
 
 	config.InitRuntimeFiles(true)
@@ -368,6 +430,11 @@ func main() {
 
 	defer func() {
 		if err := recover(); err != nil {
+			if pscalIsEmbeddedRuntime() {
+				if _, ok := pscalExitCodeFromRecovered(err); ok {
+					panic(err)
+				}
+			}
 			if screen.Screen != nil {
 				screen.Screen.Fini()
 			}
@@ -412,7 +479,16 @@ func main() {
 
 	if len(b) == 0 {
 		// No buffers to open
-		screen.Screen.Fini()
+		if screen.Screen != nil {
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Println("Warning: ignored panic during screen shutdown:", r)
+					}
+				}()
+				screen.Screen.Fini()
+			}()
+		}
 		runtime.Goexit()
 	}
 
@@ -443,25 +519,35 @@ func main() {
 	}
 
 	screen.Events = make(chan tcell.Event)
+	eventsCh := screen.Events
 
 	util.Sigterm = make(chan os.Signal, 1)
 	sighup = make(chan os.Signal, 1)
-	signal.Notify(util.Sigterm, syscall.SIGTERM, syscall.SIGINT, syscall.SIGQUIT, syscall.SIGABRT)
+	signal.Notify(util.Sigterm, syscall.SIGTERM, syscall.SIGINT, syscall.SIGQUIT)
 	signal.Notify(sighup, syscall.SIGHUP)
 
 	timerChan = make(chan func())
 
 	// Here is the event loop which runs in a separate thread
-	go func() {
+	go func(scr tcell.Screen, events chan tcell.Event) {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Println("Warning: ignored panic in event poll loop:", r)
+			}
+		}()
 		for {
 			screen.Lock()
-			e := screen.Screen.PollEvent()
+			e := scr.PollEvent()
 			screen.Unlock()
-			if e != nil {
-				screen.Events <- e
+			if e == nil {
+				if pscalEmbeddedMode {
+					return
+				}
+				continue
 			}
+			events <- e
 		}
-	}()
+	}(screen.Screen, eventsCh)
 
 	// clear the drawchan so we don't redraw excessively
 	// if someone requested a redraw before we started displaying
@@ -480,6 +566,10 @@ func main() {
 	for {
 		DoEvent()
 	}
+}
+
+func main() {
+	pscalMicroMain()
 }
 
 // DoEvent runs the main action loop of the editor
@@ -525,6 +615,12 @@ func DoEvent() {
 		log.Println("tcell event error: ", e.Error())
 
 		if e.Err() == io.EOF {
+			// In embedded mode EOF may be transient while the host PTY bridge
+			// settles; keep the editor loop alive instead of hard-exiting.
+			if pscalIsEmbeddedRuntime() {
+				time.Sleep(10 * time.Millisecond)
+				return
+			}
 			// shutdown due to terminal closing/becoming inaccessible
 			exit(0)
 		}
