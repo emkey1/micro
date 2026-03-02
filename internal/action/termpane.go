@@ -2,7 +2,6 @@ package action
 
 import (
 	"errors"
-	"runtime"
 
 	"github.com/micro-editor/micro/v2/internal/clipboard"
 	"github.com/micro-editor/micro/v2/internal/config"
@@ -105,7 +104,7 @@ func (t *TermPane) Quit() {
 	} else {
 		screen.Screen.Fini()
 		InfoBar.Close()
-		runtime.Goexit()
+		RequestQuit(0)
 	}
 }
 

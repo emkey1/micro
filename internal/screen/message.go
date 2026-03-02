@@ -8,6 +8,24 @@ import (
 	"strings"
 )
 
+func readEnter(reader *bufio.Reader) {
+	for {
+		b, err := reader.ReadByte()
+		if err != nil {
+			return
+		}
+		if b == '\n' || b == '\r' {
+			// Swallow the LF in CRLF to keep subsequent reads aligned.
+			if b == '\r' {
+				if next, err := reader.Peek(1); err == nil && len(next) == 1 && next[0] == '\n' {
+					_, _ = reader.ReadByte()
+				}
+			}
+			return
+		}
+	}
+}
+
 // TermMessage sends a message to the user in the terminal. This usually occurs before
 // micro has been fully initialized -- ie if there is an error in the syntax highlighting
 // regular expressions
@@ -21,7 +39,7 @@ func TermMessage(msg ...any) {
 	fmt.Print("\nPress enter to continue")
 
 	reader := bufio.NewReader(os.Stdin)
-	reader.ReadString('\n')
+	readEnter(reader)
 
 	TempStart(screenb)
 }
@@ -40,7 +58,7 @@ func TermPrompt(prompt string, options []string, wait bool) int {
 		reader := bufio.NewReader(os.Stdin)
 		fmt.Print(prompt)
 		resp, _ := reader.ReadString('\n')
-		resp = strings.TrimSpace(resp)
+		resp = strings.TrimSpace(strings.TrimRight(resp, "\r"))
 
 		for i, opt := range options {
 			if resp == opt {

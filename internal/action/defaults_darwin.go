@@ -28,6 +28,8 @@ var bufdefaults = map[string]string{
 	"Alt-{":          "ParagraphPrevious",
 	"Alt-}":          "ParagraphNext",
 	"Enter":          "InsertNewline",
+	"CtrlM":          "InsertNewline",
+	"CtrlJ":          "InsertNewline",
 	"CtrlH":          "Backspace",
 	"Backspace":      "Backspace",
 	"OldBackspace":   "Backspace",
@@ -74,7 +76,7 @@ var bufdefaults = map[string]string{
 	"Ctrl-e":         "CommandMode",
 	"Ctrl-w":         "NextSplit|FirstSplit",
 	"Ctrl-u":         "ToggleMacro",
-	"Ctrl-j":         "PlayMacro",
+	"Ctrl-j":         "InsertNewline|PlayMacro",
 	"Insert":         "ToggleOverwriteMode",
 
 	// Emacs-style keybindings
@@ -137,6 +139,7 @@ var infodefaults = map[string]string{
 	"CtrlShiftUp":    "SelectToStart",
 	"CtrlShiftDown":  "SelectToEnd",
 	"Enter":          "ExecuteCommand",
+	"CtrlJ":          "ExecuteCommand",
 	"CtrlH":          "Backspace",
 	"Backspace":      "Backspace",
 	"OldBackspace":   "Backspace",

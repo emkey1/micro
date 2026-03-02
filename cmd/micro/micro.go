@@ -42,14 +42,29 @@ var (
 
 	sighup chan os.Signal
 
-	timerChan          chan func()
-	pscalEventPollStop chan struct{}
-	pscalEventPollDone chan struct{}
+	timerChan            chan func()
+	pscalEventPollStop   chan struct{}
+	pscalEventPollDone   chan struct{}
+	pscalResizeWatchStop chan struct{}
+	pscalResizeWatchDone chan struct{}
 )
 
 var pscalEmbeddedMode bool
 var pscalLastResizeCols int
 var pscalLastResizeRows int
+
+func pscalEnvResizePollingEnabled() bool {
+	if !pscalIsEmbeddedRuntime() {
+		return false
+	}
+	value := strings.TrimSpace(pscalLookupEnv("PSCAL_MICRO_ENV_RESIZE_POLL"))
+	if value == "" {
+		// Embedded bridge updates COLUMNS/LINES per-session.
+		// Default to polling-on unless explicitly disabled.
+		return true
+	}
+	return value != "" && value != "0"
+}
 
 type pscalExitPanic struct {
 	code int
@@ -59,12 +74,12 @@ func pscalIsEmbeddedRuntime() bool {
 	if pscalEmbeddedMode {
 		return true
 	}
-	return os.Getenv("PSCAL_MICRO_EMBEDDED") == "1"
+	return pscalLookupEnv("PSCAL_MICRO_EMBEDDED") == "1"
 }
 
 func pscalParseEnvSize() (int, int, bool) {
 	parse := func(name string, fallback int) int {
-		value := strings.TrimSpace(os.Getenv(name))
+		value := strings.TrimSpace(pscalLookupEnv(name))
 		if value == "" {
 			return fallback
 		}
@@ -82,11 +97,21 @@ func pscalParseEnvSize() (int, int, bool) {
 	return cols, rows, true
 }
 
+func pscalSyncGoEnvSizeFromC() (int, int, bool) {
+	cols, rows, ok := pscalParseEnvSize()
+	if !ok {
+		return 0, 0, false
+	}
+	_ = os.Setenv("COLUMNS", strconv.Itoa(cols))
+	_ = os.Setenv("LINES", strconv.Itoa(rows))
+	return cols, rows, true
+}
+
 func pscalPostResizeFromEnv(force bool) {
 	if !pscalIsEmbeddedRuntime() || screen.Screen == nil {
 		return
 	}
-	cols, rows, ok := pscalParseEnvSize()
+	cols, rows, ok := pscalSyncGoEnvSizeFromC()
 	if !ok {
 		return
 	}
@@ -371,6 +396,7 @@ func exit(rc int) {
 	if sighup != nil {
 		signal.Stop(sighup)
 	}
+	pscalStopResizeWatcher(screen.Screen)
 	pscalStopEventPoller(screen.Screen)
 
 	for _, b := range buffer.OpenBuffers {
@@ -413,6 +439,46 @@ func pscalStopEventPoller(scr tcell.Screen) {
 			}()
 			_ = scr.PostEvent(tcell.NewEventResize(1, 1))
 		}()
+	}
+	if done != nil {
+		select {
+		case <-done:
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+}
+
+func pscalStartResizeWatcher(scr tcell.Screen) {
+	if !pscalIsEmbeddedRuntime() || !pscalEnvResizePollingEnabled() || scr == nil || pscalResizeWatchStop != nil {
+		return
+	}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	pscalResizeWatchStop = stop
+	pscalResizeWatchDone = done
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(75 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				pscalPostResizeFromEnv(false)
+			}
+		}
+	}()
+}
+
+func pscalStopResizeWatcher(scr tcell.Screen) {
+	stop := pscalResizeWatchStop
+	done := pscalResizeWatchDone
+	pscalResizeWatchStop = nil
+	pscalResizeWatchDone = nil
+
+	if stop != nil {
+		close(stop)
 	}
 	if done != nil {
 		select {
@@ -653,6 +719,7 @@ func pscalMicroMain() {
 	// resize events are unreliable. Seed an explicit initial resize from
 	// COLUMNS/LINES when available.
 	pscalPostResizeFromEnv(true)
+	pscalStartResizeWatcher(screen.Screen)
 
 	// wait for initial resize event
 	select {
@@ -675,7 +742,12 @@ func main() {
 func DoEvent() {
 	var event tcell.Event
 
-	pscalPostResizeFromEnv(false)
+	// In embedded/iOS mode, bridge code updates COLUMNS/LINES for the active
+	// session and posts SIGWINCH. Polling keeps micro aligned even when terminal
+	// ioctls are unavailable (pipe relay mode).
+	if pscalEnvResizePollingEnabled() {
+		pscalPostResizeFromEnv(false)
+	}
 
 	// Display everything
 	screen.Screen.Fill(' ', config.DefStyle)

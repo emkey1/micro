@@ -101,6 +101,7 @@ func pscalRunEmbedded(args []string) (status int) {
 	os.Args = args
 	pscalEmbeddedMode = true
 	_ = os.Setenv("PSCAL_MICRO_EMBEDDED", "1")
+	_, _, _ = pscalSyncGoEnvSizeFromC()
 	defer func() {
 		pscalEmbeddedMode = false
 		os.Args = savedArgs

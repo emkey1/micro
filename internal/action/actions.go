@@ -1906,7 +1906,7 @@ func (h *BufPane) ForceQuit() bool {
 	} else {
 		screen.Screen.Fini()
 		InfoBar.Close()
-		runtime.Goexit()
+		RequestQuit(0)
 	}
 	return true
 }
@@ -1956,7 +1956,7 @@ func (h *BufPane) QuitAll() bool {
 		buffer.CloseOpenBuffers()
 		screen.Screen.Fini()
 		InfoBar.Close()
-		runtime.Goexit()
+		RequestQuit(0)
 	}
 
 	if anyModified {
