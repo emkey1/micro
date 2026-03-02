@@ -9,7 +9,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"runtime/pprof"
 	"sort"
 	"strconv"
@@ -43,10 +42,14 @@ var (
 
 	sighup chan os.Signal
 
-	timerChan chan func()
+	timerChan          chan func()
+	pscalEventPollStop chan struct{}
+	pscalEventPollDone chan struct{}
 )
 
 var pscalEmbeddedMode bool
+var pscalLastResizeCols int
+var pscalLastResizeRows int
 
 type pscalExitPanic struct {
 	code int
@@ -57,6 +60,42 @@ func pscalIsEmbeddedRuntime() bool {
 		return true
 	}
 	return os.Getenv("PSCAL_MICRO_EMBEDDED") == "1"
+}
+
+func pscalParseEnvSize() (int, int, bool) {
+	parse := func(name string, fallback int) int {
+		value := strings.TrimSpace(os.Getenv(name))
+		if value == "" {
+			return fallback
+		}
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed <= 0 || parsed > 1000 {
+			return fallback
+		}
+		return parsed
+	}
+	cols := parse("COLUMNS", 0)
+	rows := parse("LINES", 0)
+	if cols <= 0 || rows <= 0 {
+		return 0, 0, false
+	}
+	return cols, rows, true
+}
+
+func pscalPostResizeFromEnv(force bool) {
+	if !pscalIsEmbeddedRuntime() || screen.Screen == nil {
+		return
+	}
+	cols, rows, ok := pscalParseEnvSize()
+	if !ok {
+		return
+	}
+	if !force && cols == pscalLastResizeCols && rows == pscalLastResizeRows {
+		return
+	}
+	pscalLastResizeCols = cols
+	pscalLastResizeRows = rows
+	_ = screen.Screen.PostEvent(tcell.NewEventResize(cols, rows))
 }
 
 func pscalExitCodeFromRecovered(v interface{}) (int, bool) {
@@ -271,11 +310,12 @@ func LoadInput(args []string) []*buffer.Buffer {
 		}
 	} else {
 		btype := buffer.BTDefault
-		if !isatty.IsTerminal(os.Stdout.Fd()) {
+		embedded := pscalIsEmbeddedRuntime()
+		if !embedded && !isatty.IsTerminal(os.Stdout.Fd()) {
 			btype = buffer.BTStdout
 		}
 
-		if !isatty.IsTerminal(os.Stdin.Fd()) {
+		if !embedded && !isatty.IsTerminal(os.Stdin.Fd()) {
 			// Option 2
 			// The input is not a terminal, so something is being piped in
 			// and we should read from stdin
@@ -324,6 +364,15 @@ func checkBackup(name string) error {
 }
 
 func exit(rc int) {
+	config.StopAutoSave()
+	if util.Sigterm != nil {
+		signal.Stop(util.Sigterm)
+	}
+	if sighup != nil {
+		signal.Stop(sighup)
+	}
+	pscalStopEventPoller(screen.Screen)
+
 	for _, b := range buffer.OpenBuffers {
 		if !b.Modified() {
 			b.Fini()
@@ -346,6 +395,31 @@ func exit(rc int) {
 	}
 
 	os.Exit(rc)
+}
+
+func pscalStopEventPoller(scr tcell.Screen) {
+	stop := pscalEventPollStop
+	done := pscalEventPollDone
+	pscalEventPollStop = nil
+	pscalEventPollDone = nil
+
+	if stop != nil {
+		close(stop)
+	}
+	if scr != nil {
+		func() {
+			defer func() {
+				_ = recover()
+			}()
+			_ = scr.PostEvent(tcell.NewEventResize(1, 1))
+		}()
+	}
+	if done != nil {
+		select {
+		case <-done:
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
 }
 
 func pscalMicroMain() {
@@ -466,6 +540,7 @@ func pscalMicroMain() {
 
 	action.InitBindings()
 	action.InitCommands()
+	action.SetQuitFunc(exit)
 
 	err = config.RunPluginFn("preinit")
 	if err != nil {
@@ -489,7 +564,7 @@ func pscalMicroMain() {
 				screen.Screen.Fini()
 			}()
 		}
-		runtime.Goexit()
+		exit(0)
 	}
 
 	action.InitTabs(b)
@@ -527,33 +602,57 @@ func pscalMicroMain() {
 	signal.Notify(sighup, syscall.SIGHUP)
 
 	timerChan = make(chan func())
+	pollStop := make(chan struct{})
+	pollDone := make(chan struct{})
+	pscalEventPollStop = pollStop
+	pscalEventPollDone = pollDone
 
 	// Here is the event loop which runs in a separate thread
-	go func(scr tcell.Screen, events chan tcell.Event) {
+	go func(scr tcell.Screen, events chan tcell.Event, stop <-chan struct{}, done chan<- struct{}) {
+		defer close(done)
 		defer func() {
 			if r := recover(); r != nil {
 				log.Println("Warning: ignored panic in event poll loop:", r)
 			}
 		}()
 		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
 			screen.Lock()
 			e := scr.PollEvent()
 			screen.Unlock()
+			select {
+			case <-stop:
+				return
+			default:
+			}
 			if e == nil {
 				if pscalEmbeddedMode {
 					return
 				}
 				continue
 			}
-			events <- e
+			select {
+			case events <- e:
+			case <-stop:
+				return
+			}
 		}
-	}(screen.Screen, eventsCh)
+	}(screen.Screen, eventsCh, pollStop, pollDone)
 
 	// clear the drawchan so we don't redraw excessively
 	// if someone requested a redraw before we started displaying
 	for len(screen.DrawChan()) > 0 {
 		<-screen.DrawChan()
 	}
+
+	// In embedded/iOS mode we may run over stdio relays where terminal-driven
+	// resize events are unreliable. Seed an explicit initial resize from
+	// COLUMNS/LINES when available.
+	pscalPostResizeFromEnv(true)
 
 	// wait for initial resize event
 	select {
@@ -575,6 +674,8 @@ func main() {
 // DoEvent runs the main action loop of the editor
 func DoEvent() {
 	var event tcell.Event
+
+	pscalPostResizeFromEnv(false)
 
 	// Display everything
 	screen.Screen.Fill(' ', config.DefStyle)
