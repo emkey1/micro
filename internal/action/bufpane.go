@@ -4,12 +4,9 @@ import (
 	"strings"
 	"time"
 
-	luar "layeh.com/gopher-luar"
-
 	"github.com/micro-editor/micro/v2/internal/buffer"
 	"github.com/micro-editor/micro/v2/internal/config"
 	"github.com/micro-editor/micro/v2/internal/display"
-	ulua "github.com/micro-editor/micro/v2/internal/lua"
 	"github.com/micro-editor/micro/v2/internal/screen"
 	"github.com/micro-editor/micro/v2/internal/util"
 	"github.com/micro-editor/tcell/v2"
@@ -48,6 +45,9 @@ func init() {
 // LuaAction makes an action from a lua function. It returns either a BufKeyAction
 // or a BufMouseAction depending on the event type.
 func LuaAction(fn string, k Event) BufAction {
+	if !config.PluginRuntimeEnabled() {
+		return nil
+	}
 	luaFn := strings.Split(fn, ".")
 	if len(luaFn) <= 1 {
 		return nil
@@ -62,7 +62,7 @@ func LuaAction(fn string, k Event) BufAction {
 	switch k.(type) {
 	case KeyEvent, KeySequenceEvent, RawEvent:
 		action = BufKeyAction(func(h *BufPane) bool {
-			val, err := pl.Call(plFn, luar.New(ulua.L, h))
+			val, err := pl.CallAny(plFn, h)
 			if err != nil {
 				screen.TermMessage(err)
 			}
@@ -74,7 +74,7 @@ func LuaAction(fn string, k Event) BufAction {
 		})
 	case MouseEvent:
 		action = BufMouseAction(func(h *BufPane, te *tcell.EventMouse) bool {
-			val, err := pl.Call(plFn, luar.New(ulua.L, h), luar.New(ulua.L, te))
+			val, err := pl.CallAny(plFn, h, te)
 			if err != nil {
 				screen.TermMessage(err)
 			}
@@ -290,9 +290,11 @@ func (h *BufPane) finishInitialize() {
 	h.initialRelocate()
 	h.initialized = true
 
-	err := config.RunPluginFn("onBufPaneOpen", luar.New(ulua.L, h))
-	if err != nil {
-		screen.TermMessage(err)
+	if config.PluginRuntimeEnabled() {
+		err := config.RunPluginFnAny("onBufPaneOpen", h)
+		if err != nil {
+			screen.TermMessage(err)
+		}
 	}
 }
 
@@ -325,12 +327,13 @@ func (h *BufPane) ResizePane(size int) {
 // The bufpane is passed as the first argument to the callbacks,
 // optional args are passed as the next arguments.
 func (h *BufPane) PluginCB(cb string, args ...any) bool {
-	largs := []lua.LValue{luar.New(ulua.L, h)}
-	for _, a := range args {
-		largs = append(largs, luar.New(ulua.L, a))
+	if !config.PluginRuntimeEnabled() {
+		return true
 	}
-
-	b, err := config.RunPluginFnBool(h.Buf.Settings, cb, largs...)
+	argv := make([]any, 0, len(args)+1)
+	argv = append(argv, h)
+	argv = append(argv, args...)
+	b, err := config.RunPluginFnBoolAny(h.Buf.Settings, cb, argv...)
 	if err != nil {
 		screen.TermMessage(err)
 	}
@@ -712,9 +715,11 @@ func (h *BufPane) SetActive(b bool) {
 			InfoBar.ClearGutter()
 		}
 
-		err := config.RunPluginFn("onSetActive", luar.New(ulua.L, h))
-		if err != nil {
-			screen.TermMessage(err)
+		if config.PluginRuntimeEnabled() {
+			err := config.RunPluginFnAny("onSetActive", h)
+			if err != nil {
+				screen.TermMessage(err)
+			}
 		}
 	}
 }

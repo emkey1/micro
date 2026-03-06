@@ -7,12 +7,9 @@ import (
 	"strconv"
 	"strings"
 
-	luar "layeh.com/gopher-luar"
-
 	runewidth "github.com/mattn/go-runewidth"
 	"github.com/micro-editor/micro/v2/internal/buffer"
 	"github.com/micro-editor/micro/v2/internal/config"
-	ulua "github.com/micro-editor/micro/v2/internal/lua"
 	"github.com/micro-editor/micro/v2/internal/screen"
 	"github.com/micro-editor/micro/v2/internal/util"
 	lua "github.com/yuin/gopher-lua"
@@ -62,6 +59,9 @@ var statusInfo = map[string]func(*buffer.Buffer) string{
 }
 
 func SetStatusInfoFnLua(fn string) {
+	if !config.PluginRuntimeEnabled() {
+		return
+	}
 	luaFn := strings.Split(fn, ".")
 	if len(luaFn) <= 1 {
 		return
@@ -72,10 +72,10 @@ func SetStatusInfoFnLua(fn string) {
 		return
 	}
 	statusInfo[fn] = func(b *buffer.Buffer) string {
-		if pl == nil || !pl.IsLoaded() {
+		if !config.PluginRuntimeEnabled() || pl == nil || !pl.IsLoaded() {
 			return ""
 		}
-		val, err := pl.Call(plFn, luar.New(ulua.L, b))
+		val, err := pl.CallAny(plFn, b)
 		if err == nil {
 			if v, ok := val.(lua.LString); !ok {
 				screen.TermMessage(plFn, "should return a string")

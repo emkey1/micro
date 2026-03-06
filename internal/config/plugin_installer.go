@@ -381,6 +381,8 @@ func GetInstalledVersions(withCore bool) PluginVersions {
 
 // GetInstalledPluginVersion returns the string of the exported VERSION variable of a loaded plugin
 func GetInstalledPluginVersion(name string) string {
+	ulua.Lock()
+	defer ulua.Unlock()
 	plugin := ulua.L.GetGlobal(name)
 	if plugin != lua.LNil {
 		version := ulua.L.GetField(plugin, "VERSION")

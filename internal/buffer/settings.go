@@ -5,11 +5,9 @@ import (
 	"reflect"
 
 	"github.com/micro-editor/micro/v2/internal/config"
-	ulua "github.com/micro-editor/micro/v2/internal/lua"
 	"github.com/micro-editor/micro/v2/internal/screen"
 	"golang.org/x/text/encoding/htmlindex"
 	"golang.org/x/text/encoding/unicode"
-	luar "layeh.com/gopher-luar"
 )
 
 func (b *Buffer) ReloadSettings(reloadFiletype bool) {
@@ -168,9 +166,10 @@ func (b *Buffer) doCallbacks(option string, oldValue any, newValue any) {
 		b.OptionCallback(option, newValue)
 	}
 
-	if err := config.RunPluginFn("onBufferOptionChanged",
-		luar.New(ulua.L, b), luar.New(ulua.L, option),
-		luar.New(ulua.L, oldValue), luar.New(ulua.L, newValue)); err != nil {
-		screen.TermMessage(err)
+	if config.PluginRuntimeEnabled() {
+		if err := config.RunPluginFnAny("onBufferOptionChanged",
+			b, option, oldValue, newValue); err != nil {
+			screen.TermMessage(err)
+		}
 	}
 }

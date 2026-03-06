@@ -5,11 +5,9 @@ import (
 	"time"
 
 	"github.com/micro-editor/micro/v2/internal/config"
-	ulua "github.com/micro-editor/micro/v2/internal/lua"
 	"github.com/micro-editor/micro/v2/internal/screen"
 	"github.com/micro-editor/micro/v2/internal/util"
 	dmp "github.com/sergi/go-diff/diffmatchpatch"
-	luar "layeh.com/gopher-luar"
 )
 
 const (
@@ -241,9 +239,13 @@ func (eh *EventHandler) Execute(t *TextEvent) {
 	}
 	eh.UndoStack.Push(t)
 
-	b, err := config.RunPluginFnBool(nil, "onBeforeTextEvent", luar.New(ulua.L, eh.buf), luar.New(ulua.L, t))
-	if err != nil {
-		screen.TermMessage(err)
+	b := true
+	if config.PluginRuntimeEnabled() {
+		var err error
+		b, err = config.RunPluginFnBoolAny(nil, "onBeforeTextEvent", eh.buf, t)
+		if err != nil {
+			screen.TermMessage(err)
+		}
 	}
 
 	if !b {

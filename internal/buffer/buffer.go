@@ -15,10 +15,7 @@ import (
 	"sync"
 	"time"
 
-	luar "layeh.com/gopher-luar"
-
 	"github.com/micro-editor/micro/v2/internal/config"
-	ulua "github.com/micro-editor/micro/v2/internal/lua"
 	"github.com/micro-editor/micro/v2/internal/screen"
 	"github.com/micro-editor/micro/v2/internal/util"
 	"github.com/micro-editor/micro/v2/pkg/highlight"
@@ -489,9 +486,11 @@ func NewBuffer(r io.Reader, size int64, path string, btype BufType, cmd Command)
 		}
 	}
 
-	err = config.RunPluginFn("onBufferOpen", luar.New(ulua.L, b))
-	if err != nil {
-		screen.TermMessage(err)
+	if config.PluginRuntimeEnabled() {
+		err = config.RunPluginFnAny("onBufferOpen", b)
+		if err != nil {
+			screen.TermMessage(err)
+		}
 	}
 
 	OpenBuffers = append(OpenBuffers, b)

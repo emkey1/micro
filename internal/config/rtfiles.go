@@ -179,6 +179,10 @@ func InitRuntimeFiles(user bool) {
 
 // InitPlugins initializes the plugins
 func InitPlugins() {
+	if !PluginRuntimeEnabled() {
+		Plugins = Plugins[:0]
+		return
+	}
 	Plugins = Plugins[:0]
 	initlua := filepath.Join(ConfigDir, "init.lua")
 

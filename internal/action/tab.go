@@ -1,12 +1,9 @@
 package action
 
 import (
-	luar "layeh.com/gopher-luar"
-
 	"github.com/micro-editor/micro/v2/internal/buffer"
 	"github.com/micro-editor/micro/v2/internal/config"
 	"github.com/micro-editor/micro/v2/internal/display"
-	ulua "github.com/micro-editor/micro/v2/internal/lua"
 	"github.com/micro-editor/micro/v2/internal/screen"
 	"github.com/micro-editor/micro/v2/internal/views"
 	"github.com/micro-editor/tcell/v2"
@@ -157,9 +154,11 @@ func (t *TabList) SetActive(a int) {
 			if !p.isActive {
 				p.isActive = true
 
-				err := config.RunPluginFn("onSetActive", luar.New(ulua.L, p.CurPane()))
-				if err != nil {
-					screen.TermMessage(err)
+				if config.PluginRuntimeEnabled() {
+					err := config.RunPluginFnAny("onSetActive", p.CurPane())
+					if err != nil {
+						screen.TermMessage(err)
+					}
 				}
 			}
 		} else {

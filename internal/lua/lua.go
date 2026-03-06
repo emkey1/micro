@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -26,6 +27,73 @@ import (
 )
 
 var L *lua.LState
+var luaMu sync.Mutex
+var luaOwnerMu sync.Mutex
+var luaOwnerGID uint64
+var luaDepth int
+
+func currentGoID() uint64 {
+	var buf [64]byte
+	n := runtime.Stack(buf[:], false)
+	if n <= 0 {
+		return 0
+	}
+	const prefix = "goroutine "
+	if n <= len(prefix) || !bytes.HasPrefix(buf[:n], []byte(prefix)) {
+		return 0
+	}
+	var id uint64
+	for i := len(prefix); i < n; i++ {
+		c := buf[i]
+		if c < '0' || c > '9' {
+			if i == len(prefix) {
+				return 0
+			}
+			return id
+		}
+		id = (id * 10) + uint64(c-'0')
+	}
+	return id
+}
+
+// Lock serializes access to the process-global Lua VM used by micro plugins.
+func Lock() {
+	gid := currentGoID()
+	luaOwnerMu.Lock()
+	if luaDepth > 0 && luaOwnerGID == gid && gid != 0 {
+		luaDepth++
+		luaOwnerMu.Unlock()
+		return
+	}
+	luaOwnerMu.Unlock()
+	luaMu.Lock()
+	luaOwnerMu.Lock()
+	luaOwnerGID = gid
+	luaDepth = 1
+	luaOwnerMu.Unlock()
+}
+
+// Unlock releases the global Lua VM lock.
+func Unlock() {
+	gid := currentGoID()
+	luaOwnerMu.Lock()
+	if luaDepth <= 0 {
+		luaOwnerMu.Unlock()
+		panic("lua unlock without matching lock")
+	}
+	if luaOwnerGID != 0 && gid != 0 && luaOwnerGID != gid {
+		luaOwnerMu.Unlock()
+		panic("lua unlock by non-owner goroutine")
+	}
+	luaDepth--
+	if luaDepth > 0 {
+		luaOwnerMu.Unlock()
+		return
+	}
+	luaOwnerGID = 0
+	luaOwnerMu.Unlock()
+	luaMu.Unlock()
+}
 
 // LoadFile loads a lua file
 func LoadFile(module string, file string, data []byte) error {
