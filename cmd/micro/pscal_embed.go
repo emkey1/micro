@@ -4,6 +4,8 @@ package main
 
 /*
 #include <stdint.h>
+uint64_t pscal_micro_current_session_id(void);
+int pscal_micro_current_stdio_fds(int *stdin_fd, int *stdout_fd);
 */
 import "C"
 
@@ -12,14 +14,100 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"unsafe"
+
+	"github.com/micro-editor/tcell/v2"
 )
 
-var pscalEmbedRunState struct {
-	sync.Mutex
-	running bool
+var pscalRuntimeRegistryMu sync.Mutex
+var pscalRuntimeRegistry = map[uint64]*pscalRuntimeState{}
+
+func pscalSessionIDFromHost() uint64 {
+	return uint64(C.pscal_micro_current_session_id())
+}
+
+func pscalCurrentStdioFDsFromHost() (int, int, bool) {
+	var stdinFD C.int
+	var stdoutFD C.int
+	if C.pscal_micro_current_stdio_fds(&stdinFD, &stdoutFD) == 0 {
+		return 0, 0, false
+	}
+	if stdinFD < 0 || stdoutFD < 0 {
+		return 0, 0, false
+	}
+	return int(stdinFD), int(stdoutFD), true
+}
+
+func pscalPopulateRuntimeLaunchContext(rt *pscalRuntimeState) {
+	if rt == nil {
+		return
+	}
+	if sessionID := pscalSessionIDFromHost(); sessionID != 0 {
+		rt.sessionID = sessionID
+	} else {
+		rt.sessionID = pscalSessionIDFromEnv()
+	}
+	if stdinFD, stdoutFD, ok := pscalCurrentStdioFDsFromHost(); ok {
+		rt.tcellInFD = stdinFD
+		rt.tcellOutFD = stdoutFD
+	} else {
+		rt.tcellInFD = -1
+		rt.tcellOutFD = -1
+	}
+}
+
+func pscalSessionIDFromEnv() uint64 {
+	value := strings.TrimSpace(os.Getenv("PSCAL_MICRO_SESSION_ID"))
+	if value == "" {
+		return 0
+	}
+	id, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return id
+}
+
+func pscalRegisterRuntime(rt *pscalRuntimeState) {
+	if rt == nil || rt.sessionID == 0 {
+		return
+	}
+	pscalRuntimeRegistryMu.Lock()
+	pscalRuntimeRegistry[rt.sessionID] = rt
+	pscalRuntimeRegistryMu.Unlock()
+}
+
+func pscalUnregisterRuntime(rt *pscalRuntimeState) {
+	if rt == nil || rt.sessionID == 0 {
+		return
+	}
+	pscalRuntimeRegistryMu.Lock()
+	current, ok := pscalRuntimeRegistry[rt.sessionID]
+	if ok && current == rt {
+		delete(pscalRuntimeRegistry, rt.sessionID)
+	}
+	pscalRuntimeRegistryMu.Unlock()
+}
+
+func pscalPostRuntimeResize(sessionID uint64, cols, rows int) bool {
+	if sessionID == 0 || cols <= 0 || rows <= 0 {
+		return false
+	}
+	pscalRuntimeRegistryMu.Lock()
+	rt := pscalRuntimeRegistry[sessionID]
+	pscalRuntimeRegistryMu.Unlock()
+	if rt == nil || rt.screen == nil {
+		return false
+	}
+	rt.lastResizeCols = cols
+	rt.lastResizeRows = rows
+	defer func() {
+		_ = recover()
+	}()
+	return rt.screen.PostEvent(tcell.NewEventResize(cols, rows)) == nil
 }
 
 func pscalHasConfigDirFlag(args []string) bool {
@@ -77,20 +165,6 @@ func pscalInjectConfigDir(args []string, configDir string) []string {
 }
 
 func pscalRunEmbedded(args []string) (status int) {
-	pscalEmbedRunState.Lock()
-	if pscalEmbedRunState.running {
-		pscalEmbedRunState.Unlock()
-		fmt.Fprintln(os.Stderr, "micro: already running")
-		return 1
-	}
-	pscalEmbedRunState.running = true
-	pscalEmbedRunState.Unlock()
-	defer func() {
-		pscalEmbedRunState.Lock()
-		pscalEmbedRunState.running = false
-		pscalEmbedRunState.Unlock()
-	}()
-
 	configDir := pscalPrepareConfigEnv()
 	if configDir == "" {
 		fmt.Fprintln(os.Stderr, "micro: warning: unable to resolve writable config directory")
@@ -98,13 +172,18 @@ func pscalRunEmbedded(args []string) (status int) {
 	args = pscalInjectConfigDir(args, configDir)
 	savedArgs := os.Args
 	savedEmbeddedEnv, hadEmbeddedEnv := os.LookupEnv("PSCAL_MICRO_EMBEDDED")
+	rt := &pscalRuntimeState{
+		embeddedMode: true,
+		sessionID:    0,
+	}
+	pscalPopulateRuntimeLaunchContext(rt)
+	pscalRegisterRuntime(rt)
 	os.Args = args
-	pscalEmbeddedMode = true
 	_ = os.Setenv("PSCAL_MICRO_EMBEDDED", "1")
 	_, _, _ = pscalSyncGoEnvSizeFromC()
 	defer func() {
-		pscalEmbeddedMode = false
 		os.Args = savedArgs
+		pscalUnregisterRuntime(rt)
 		if hadEmbeddedEnv {
 			_ = os.Setenv("PSCAL_MICRO_EMBEDDED", savedEmbeddedEnv)
 		} else {
@@ -124,7 +203,7 @@ func pscalRunEmbedded(args []string) (status int) {
 		}
 	}()
 
-	pscalMicroMain()
+	pscalMicroMain(rt)
 	return status
 }
 
@@ -154,4 +233,12 @@ func pscal_micro_go_main_entry(argc C.int, argv **C.char) C.int {
 	args := pscalArgvToStrings(argc, argv)
 	status := pscalRunEmbedded(args)
 	return C.int(status)
+}
+
+//export pscal_micro_go_notify_resize
+func pscal_micro_go_notify_resize(sessionID C.uint64_t, cols C.int, rows C.int) C.int {
+	if pscalPostRuntimeResize(uint64(sessionID), int(cols), int(rows)) {
+		return C.int(1)
+	}
+	return C.int(0)
 }

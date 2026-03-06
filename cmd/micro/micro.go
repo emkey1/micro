@@ -9,10 +9,12 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"runtime/pprof"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -40,38 +42,112 @@ var (
 	flagClean     *bool
 	optionFlags   map[string]*string
 
-	sighup chan os.Signal
-
-	timerChan            chan func()
-	pscalEventPollStop   chan struct{}
-	pscalEventPollDone   chan struct{}
-	pscalResizeWatchStop chan struct{}
-	pscalResizeWatchDone chan struct{}
+	timerChan chan func()
 )
 
-var pscalEmbeddedMode bool
-var pscalLastResizeCols int
-var pscalLastResizeRows int
+type pscalRuntimeState struct {
+	sessionID       uint64
+	sighup          chan os.Signal
+	sigterm         chan os.Signal
+	eventPollStop   chan struct{}
+	eventPollDone   chan struct{}
+	resizeWatchStop chan struct{}
+	resizeWatchDone chan struct{}
+	embeddedMode    bool
+	lastResizeCols  int
+	lastResizeRows  int
+	screen          tcell.Screen
+	events          chan tcell.Event
+	drawChan        chan bool
+	timer           chan func()
+	jobs            chan shell.JobFunction
+	closeTerms      chan bool
+	tabs            *action.TabList
+	infoBar         *action.InfoPane
+	logBufPane      *action.BufPane
+	openBuffers     []*buffer.Buffer
+	logBuf          *buffer.Buffer
+	tcellInFD       int
+	tcellOutFD      int
+}
 
-func pscalEnvResizePollingEnabled() bool {
-	if !pscalIsEmbeddedRuntime() {
+var pscalScreenBindMu sync.Mutex
+
+func pscalBindRuntimeScreenLocked(rt *pscalRuntimeState) {
+	if rt == nil {
+		return
+	}
+	if rt.screen != nil {
+		screen.Screen = rt.screen
+	}
+	if rt.events != nil {
+		screen.Events = rt.events
+	}
+}
+
+func pscalBindRuntimeStateLocked(rt *pscalRuntimeState) {
+	if rt == nil {
+		return
+	}
+	pscalBindRuntimeScreenLocked(rt)
+	if rt.timer != nil {
+		timerChan = rt.timer
+	}
+	if rt.jobs != nil {
+		shell.Jobs = rt.jobs
+	}
+	if rt.closeTerms != nil {
+		shell.CloseTerms = rt.closeTerms
+	}
+	if rt.sigterm != nil {
+		util.Sigterm = rt.sigterm
+	}
+	if rt.tabs != nil {
+		action.Tabs = rt.tabs
+	}
+	if rt.infoBar != nil {
+		action.InfoBar = rt.infoBar
+		buffer.SetMessager(rt.infoBar)
+	}
+	action.LogBufPane = rt.logBufPane
+	buffer.OpenBuffers = rt.openBuffers
+	buffer.LogBuf = rt.logBuf
+}
+
+func pscalCaptureRuntimeStateLocked(rt *pscalRuntimeState) {
+	if rt == nil {
+		return
+	}
+	rt.tabs = action.Tabs
+	rt.infoBar = action.InfoBar
+	rt.logBufPane = action.LogBufPane
+	rt.openBuffers = buffer.OpenBuffers
+	rt.logBuf = buffer.LogBuf
+	rt.timer = timerChan
+	rt.jobs = shell.Jobs
+	rt.closeTerms = shell.CloseTerms
+	rt.sigterm = util.Sigterm
+}
+
+func pscalEnvResizePollingEnabled(rt *pscalRuntimeState) bool {
+	if !pscalIsEmbeddedRuntime(rt) {
 		return false
 	}
 	value := strings.TrimSpace(pscalLookupEnv("PSCAL_MICRO_ENV_RESIZE_POLL"))
 	if value == "" {
-		// Embedded bridge updates COLUMNS/LINES per-session.
-		// Default to polling-on unless explicitly disabled.
-		return true
+		// Embedded bridge now posts per-session resize events directly.
+		// Default polling off to avoid shared env churn across runtimes.
+		return false
 	}
-	return value != "" && value != "0"
+	return value != "0"
 }
 
 type pscalExitPanic struct {
 	code int
 }
 
-func pscalIsEmbeddedRuntime() bool {
-	if pscalEmbeddedMode {
+func pscalIsEmbeddedRuntime(rt *pscalRuntimeState) bool {
+	if rt != nil && rt.embeddedMode {
 		return true
 	}
 	return pscalLookupEnv("PSCAL_MICRO_EMBEDDED") == "1"
@@ -107,20 +183,22 @@ func pscalSyncGoEnvSizeFromC() (int, int, bool) {
 	return cols, rows, true
 }
 
-func pscalPostResizeFromEnv(force bool) {
-	if !pscalIsEmbeddedRuntime() || screen.Screen == nil {
+func pscalPostResizeFromEnv(rt *pscalRuntimeState, force bool) {
+	if !pscalIsEmbeddedRuntime(rt) || rt == nil || rt.screen == nil {
 		return
 	}
 	cols, rows, ok := pscalSyncGoEnvSizeFromC()
 	if !ok {
 		return
 	}
-	if !force && cols == pscalLastResizeCols && rows == pscalLastResizeRows {
+	if !force && rt != nil && cols == rt.lastResizeCols && rows == rt.lastResizeRows {
 		return
 	}
-	pscalLastResizeCols = cols
-	pscalLastResizeRows = rows
-	_ = screen.Screen.PostEvent(tcell.NewEventResize(cols, rows))
+	if rt != nil {
+		rt.lastResizeCols = cols
+		rt.lastResizeRows = rows
+	}
+	_ = rt.screen.PostEvent(tcell.NewEventResize(cols, rows))
 }
 
 func pscalExitCodeFromRecovered(v interface{}) (int, bool) {
@@ -335,7 +413,7 @@ func LoadInput(args []string) []*buffer.Buffer {
 		}
 	} else {
 		btype := buffer.BTDefault
-		embedded := pscalIsEmbeddedRuntime()
+		embedded := pscalIsEmbeddedRuntime(nil)
 		if !embedded && !isatty.IsTerminal(os.Stdout.Fd()) {
 			btype = buffer.BTStdout
 		}
@@ -389,15 +467,23 @@ func checkBackup(name string) error {
 }
 
 func exit(rc int) {
+	exitWithRuntime(nil, rc)
+}
+
+func exitWithRuntime(rt *pscalRuntimeState, rc int) {
 	config.StopAutoSave()
-	if util.Sigterm != nil {
-		signal.Stop(util.Sigterm)
+	if rt != nil && rt.sigterm != nil {
+		signal.Stop(rt.sigterm)
 	}
-	if sighup != nil {
-		signal.Stop(sighup)
+	if rt != nil && rt.sighup != nil {
+		signal.Stop(rt.sighup)
 	}
-	pscalStopResizeWatcher(screen.Screen)
-	pscalStopEventPoller(screen.Screen)
+	var runtimeScreen tcell.Screen
+	if rt != nil {
+		runtimeScreen = rt.screen
+	}
+	pscalStopResizeWatcher(rt, runtimeScreen)
+	pscalStopEventPoller(rt, runtimeScreen)
 
 	for _, b := range buffer.OpenBuffers {
 		if !b.Modified() {
@@ -405,29 +491,32 @@ func exit(rc int) {
 		}
 	}
 
-	if screen.Screen != nil {
+	if runtimeScreen != nil {
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
 					log.Println("Warning: ignored panic during screen shutdown:", r)
 				}
 			}()
-			screen.Screen.Fini()
+			runtimeScreen.Fini()
 		}()
 	}
 
-	if pscalIsEmbeddedRuntime() {
+	if pscalIsEmbeddedRuntime(rt) {
 		panic(pscalExitPanic{code: rc})
 	}
 
 	os.Exit(rc)
 }
 
-func pscalStopEventPoller(scr tcell.Screen) {
-	stop := pscalEventPollStop
-	done := pscalEventPollDone
-	pscalEventPollStop = nil
-	pscalEventPollDone = nil
+func pscalStopEventPoller(rt *pscalRuntimeState, scr tcell.Screen) {
+	if rt == nil {
+		return
+	}
+	stop := rt.eventPollStop
+	done := rt.eventPollDone
+	rt.eventPollStop = nil
+	rt.eventPollDone = nil
 
 	if stop != nil {
 		close(stop)
@@ -448,14 +537,14 @@ func pscalStopEventPoller(scr tcell.Screen) {
 	}
 }
 
-func pscalStartResizeWatcher(scr tcell.Screen) {
-	if !pscalIsEmbeddedRuntime() || !pscalEnvResizePollingEnabled() || scr == nil || pscalResizeWatchStop != nil {
+func pscalStartResizeWatcher(rt *pscalRuntimeState, scr tcell.Screen) {
+	if rt == nil || !pscalIsEmbeddedRuntime(rt) || !pscalEnvResizePollingEnabled(rt) || scr == nil || rt.resizeWatchStop != nil {
 		return
 	}
 	stop := make(chan struct{})
 	done := make(chan struct{})
-	pscalResizeWatchStop = stop
-	pscalResizeWatchDone = done
+	rt.resizeWatchStop = stop
+	rt.resizeWatchDone = done
 	go func() {
 		defer close(done)
 		ticker := time.NewTicker(75 * time.Millisecond)
@@ -465,17 +554,20 @@ func pscalStartResizeWatcher(scr tcell.Screen) {
 			case <-stop:
 				return
 			case <-ticker.C:
-				pscalPostResizeFromEnv(false)
+				pscalPostResizeFromEnv(rt, false)
 			}
 		}
 	}()
 }
 
-func pscalStopResizeWatcher(scr tcell.Screen) {
-	stop := pscalResizeWatchStop
-	done := pscalResizeWatchDone
-	pscalResizeWatchStop = nil
-	pscalResizeWatchDone = nil
+func pscalStopResizeWatcher(rt *pscalRuntimeState, scr tcell.Screen) {
+	if rt == nil {
+		return
+	}
+	stop := rt.resizeWatchStop
+	done := rt.resizeWatchDone
+	rt.resizeWatchStop = nil
+	rt.resizeWatchDone = nil
 
 	if stop != nil {
 		close(stop)
@@ -488,7 +580,14 @@ func pscalStopResizeWatcher(scr tcell.Screen) {
 	}
 }
 
-func pscalMicroMain() {
+func pscalMicroMain(rt *pscalRuntimeState) {
+	if rt == nil {
+		rt = &pscalRuntimeState{}
+	}
+	if pscalIsEmbeddedRuntime(rt) {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+	}
 	defer func() {
 		if util.Stdout.Len() > 0 {
 			fmt.Fprint(os.Stdout, util.Stdout.String())
@@ -496,7 +595,7 @@ func pscalMicroMain() {
 		if r := recover(); r != nil {
 			panic(r)
 		}
-		exit(0)
+		exitWithRuntime(rt, 0)
 	}()
 
 	var err error
@@ -519,7 +618,7 @@ func pscalMicroMain() {
 	err = config.InitConfigDir(*flagConfigDir)
 	if err != nil {
 		screen.TermMessage(err)
-		exit(1)
+		exitWithRuntime(rt, 1)
 	}
 
 	config.InitRuntimeFiles(true)
@@ -528,7 +627,7 @@ func pscalMicroMain() {
 	err = checkBackup("settings.json")
 	if err != nil {
 		screen.TermMessage(err)
-		exit(1)
+		exitWithRuntime(rt, 1)
 	}
 
 	err = config.ReadSettings()
@@ -559,24 +658,28 @@ func pscalMicroMain() {
 
 	DoPluginFlags()
 
+	restoreTcellProvider := pscalInstallTcellStdioProvider(rt)
+	defer restoreTcellProvider()
 	err = screen.Init()
 	if err != nil {
 		fmt.Println(err)
 		fmt.Println("Fatal: Micro could not initialize a Screen.")
-		exit(1)
+		exitWithRuntime(rt, 1)
 	}
+	rt.screen = screen.Screen
+	rt.drawChan = screen.DrawChan()
 	m := clipboard.SetMethod(config.GetGlobalOption("clipboard").(string))
 	clipErr := clipboard.Initialize(m)
 
 	defer func() {
 		if err := recover(); err != nil {
-			if pscalIsEmbeddedRuntime() {
+			if pscalIsEmbeddedRuntime(rt) {
 				if _, ok := pscalExitCodeFromRecovered(err); ok {
 					panic(err)
 				}
 			}
-			if screen.Screen != nil {
-				screen.Screen.Fini()
+			if rt.screen != nil {
+				rt.screen.Fini()
 			}
 			if e, ok := err.(*lua.ApiError); ok {
 				fmt.Println("Lua API error:", e)
@@ -589,7 +692,7 @@ func pscalMicroMain() {
 					b.Backup()
 				}
 			}
-			exit(1)
+			exitWithRuntime(rt, 1)
 		}
 	}()
 
@@ -601,7 +704,7 @@ func pscalMicroMain() {
 	err = checkBackup("bindings.json")
 	if err != nil {
 		screen.TermMessage(err)
-		exit(1)
+		exitWithRuntime(rt, 1)
 	}
 
 	action.InitBindings()
@@ -620,20 +723,25 @@ func pscalMicroMain() {
 
 	if len(b) == 0 {
 		// No buffers to open
-		if screen.Screen != nil {
+		if rt.screen != nil {
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
 						log.Println("Warning: ignored panic during screen shutdown:", r)
 					}
 				}()
-				screen.Screen.Fini()
+				rt.screen.Fini()
 			}()
 		}
-		exit(0)
+		exitWithRuntime(rt, 0)
 	}
 
 	action.InitTabs(b)
+	func() {
+		pscalScreenBindMu.Lock()
+		defer pscalScreenBindMu.Unlock()
+		pscalCaptureRuntimeStateLocked(rt)
+	}()
 
 	err = config.RunPluginFn("init")
 	if err != nil {
@@ -659,19 +767,33 @@ func pscalMicroMain() {
 		config.SetAutoTime(a)
 	}
 
-	screen.Events = make(chan tcell.Event)
-	eventsCh := screen.Events
+	rt.events = make(chan tcell.Event)
+	screen.Events = rt.events
+	eventsCh := rt.events
 
-	util.Sigterm = make(chan os.Signal, 1)
-	sighup = make(chan os.Signal, 1)
-	signal.Notify(util.Sigterm, syscall.SIGTERM, syscall.SIGINT, syscall.SIGQUIT)
-	signal.Notify(sighup, syscall.SIGHUP)
+	if rt.sigterm == nil {
+		rt.sigterm = make(chan os.Signal, 1)
+	}
+	rt.sighup = make(chan os.Signal, 1)
+	signal.Notify(rt.sigterm, syscall.SIGTERM, syscall.SIGINT, syscall.SIGQUIT)
+	signal.Notify(rt.sighup, syscall.SIGHUP)
 
-	timerChan = make(chan func())
+	if rt.timer == nil {
+		rt.timer = make(chan func())
+	}
+	timerChan = rt.timer
+	if rt.jobs == nil {
+		rt.jobs = make(chan shell.JobFunction, 100)
+	}
+	shell.Jobs = rt.jobs
+	if rt.closeTerms == nil {
+		rt.closeTerms = make(chan bool)
+	}
+	shell.CloseTerms = rt.closeTerms
 	pollStop := make(chan struct{})
 	pollDone := make(chan struct{})
-	pscalEventPollStop = pollStop
-	pscalEventPollDone = pollDone
+	rt.eventPollStop = pollStop
+	rt.eventPollDone = pollDone
 
 	// Here is the event loop which runs in a separate thread
 	go func(scr tcell.Screen, events chan tcell.Event, stop <-chan struct{}, done chan<- struct{}) {
@@ -681,22 +803,31 @@ func pscalMicroMain() {
 				log.Println("Warning: ignored panic in event poll loop:", r)
 			}
 		}()
+		embedded := pscalIsEmbeddedRuntime(rt)
 		for {
 			select {
 			case <-stop:
 				return
 			default:
 			}
-			screen.Lock()
-			e := scr.PollEvent()
-			screen.Unlock()
+			var e tcell.Event
+			if embedded {
+				// screen.Lock() is process-global in micro. Holding it while an
+				// unfocused runtime blocks in PollEvent can starve other embedded
+				// runtimes in the same process.
+				e = scr.PollEvent()
+			} else {
+				screen.Lock()
+				e = scr.PollEvent()
+				screen.Unlock()
+			}
 			select {
 			case <-stop:
 				return
 			default:
 			}
 			if e == nil {
-				if pscalEmbeddedMode {
+				if pscalIsEmbeddedRuntime(rt) {
 					return
 				}
 				continue
@@ -707,113 +838,150 @@ func pscalMicroMain() {
 				return
 			}
 		}
-	}(screen.Screen, eventsCh, pollStop, pollDone)
+	}(rt.screen, eventsCh, pollStop, pollDone)
 
 	// clear the drawchan so we don't redraw excessively
 	// if someone requested a redraw before we started displaying
-	for len(screen.DrawChan()) > 0 {
-		<-screen.DrawChan()
+	for rt.drawChan != nil && len(rt.drawChan) > 0 {
+		<-rt.drawChan
 	}
 
 	// In embedded/iOS mode we may run over stdio relays where terminal-driven
 	// resize events are unreliable. Seed an explicit initial resize from
 	// COLUMNS/LINES when available.
-	pscalPostResizeFromEnv(true)
-	pscalStartResizeWatcher(screen.Screen)
+	pscalPostResizeFromEnv(rt, true)
+	pscalStartResizeWatcher(rt, rt.screen)
 
 	// wait for initial resize event
 	select {
-	case event := <-screen.Events:
-		action.Tabs.HandleEvent(event)
+	case event := <-rt.events:
+		func() {
+			pscalScreenBindMu.Lock()
+			defer pscalScreenBindMu.Unlock()
+			pscalBindRuntimeStateLocked(rt)
+			defer pscalCaptureRuntimeStateLocked(rt)
+			action.Tabs.HandleEvent(event)
+		}()
 	case <-time.After(10 * time.Millisecond):
 		// time out after 10ms
 	}
 
 	for {
-		DoEvent()
+		DoEvent(rt)
 	}
 }
 
 func main() {
-	pscalMicroMain()
+	pscalMicroMain(&pscalRuntimeState{})
 }
 
 // DoEvent runs the main action loop of the editor
-func DoEvent() {
+func DoEvent(rt *pscalRuntimeState) {
 	var event tcell.Event
+	var jobFunc *shell.JobFunction
+	var timerFunc func()
+	runAutosave := false
+	runCloseTerms := false
 
 	// In embedded/iOS mode, bridge code updates COLUMNS/LINES for the active
 	// session and posts SIGWINCH. Polling keeps micro aligned even when terminal
 	// ioctls are unavailable (pipe relay mode).
-	if pscalEnvResizePollingEnabled() {
-		pscalPostResizeFromEnv(false)
+	if pscalEnvResizePollingEnabled(rt) {
+		pscalPostResizeFromEnv(rt, false)
 	}
 
 	// Display everything
-	screen.Screen.Fill(' ', config.DefStyle)
-	screen.Screen.HideCursor()
-	action.Tabs.Display()
-	for _, ep := range action.MainTab().Panes {
-		ep.Display()
-	}
-	action.MainTab().Display()
-	action.InfoBar.Display()
-	screen.Screen.Show()
+	func() {
+		pscalScreenBindMu.Lock()
+		defer pscalScreenBindMu.Unlock()
+		pscalBindRuntimeStateLocked(rt)
+		defer pscalCaptureRuntimeStateLocked(rt)
+		if rt != nil && rt.screen != nil {
+			rt.screen.Fill(' ', config.DefStyle)
+			rt.screen.HideCursor()
+			action.Tabs.Display()
+			for _, ep := range action.MainTab().Panes {
+				ep.Display()
+			}
+			action.MainTab().Display()
+			action.InfoBar.Display()
+			rt.screen.Show()
+		}
+	}()
 
 	// Check for new events
 	select {
-	case f := <-shell.Jobs:
+	case f := <-rt.jobs:
 		// If a new job has finished while running in the background we should execute the callback
-		f.Function(f.Output, f.Args)
+		jobFunc = &f
 	case <-config.Autosave:
-		for _, b := range buffer.OpenBuffers {
-			b.AutoSave()
+		runAutosave = true
+	case <-rt.closeTerms:
+		runCloseTerms = true
+	case event = <-rt.events:
+	case <-rt.drawChan:
+		for len(rt.drawChan) > 0 {
+			<-rt.drawChan
 		}
-	case <-shell.CloseTerms:
-		action.Tabs.CloseTerms()
-	case event = <-screen.Events:
-	case <-screen.DrawChan():
-		for len(screen.DrawChan()) > 0 {
-			<-screen.DrawChan()
-		}
-	case f := <-timerChan:
-		f()
-	case <-sighup:
-		exit(0)
-	case <-util.Sigterm:
-		exit(0)
+	case f := <-rt.timer:
+		timerFunc = f
+	case <-rt.sighup:
+		exitWithRuntime(rt, 0)
+	case <-rt.sigterm:
+		exitWithRuntime(rt, 0)
 	}
 
-	if e, ok := event.(*tcell.EventError); ok {
-		log.Println("tcell event error: ", e.Error())
-
-		if e.Err() == io.EOF {
-			// In embedded mode EOF may be transient while the host PTY bridge
-			// settles; keep the editor loop alive instead of hard-exiting.
-			if pscalIsEmbeddedRuntime() {
-				time.Sleep(10 * time.Millisecond)
-				return
+	func() {
+		pscalScreenBindMu.Lock()
+		defer pscalScreenBindMu.Unlock()
+		pscalBindRuntimeStateLocked(rt)
+		defer pscalCaptureRuntimeStateLocked(rt)
+		if jobFunc != nil {
+			jobFunc.Function(jobFunc.Output, jobFunc.Args)
+		}
+		if runAutosave {
+			for _, b := range buffer.OpenBuffers {
+				b.AutoSave()
 			}
-			// shutdown due to terminal closing/becoming inaccessible
-			exit(0)
 		}
-		return
-	}
-
-	if event != nil {
-		_, resize := event.(*tcell.EventResize)
-		if resize {
-			action.InfoBar.HandleEvent(event)
-			action.Tabs.HandleEvent(event)
-		} else if action.InfoBar.HasPrompt {
-			action.InfoBar.HandleEvent(event)
-		} else {
-			action.Tabs.HandleEvent(event)
+		if runCloseTerms {
+			action.Tabs.CloseTerms()
 		}
-	}
+		if timerFunc != nil {
+			timerFunc()
+		}
 
-	err := config.RunPluginFn("onAnyEvent")
-	if err != nil {
-		screen.TermMessage(err)
-	}
+		if e, ok := event.(*tcell.EventError); ok {
+			log.Println("tcell event error: ", e.Error())
+
+			if e.Err() == io.EOF {
+				// In embedded mode EOF may be transient while the host PTY bridge
+				// settles; keep the editor loop alive instead of hard-exiting.
+				if pscalIsEmbeddedRuntime(rt) {
+					time.Sleep(10 * time.Millisecond)
+					return
+				}
+				// shutdown due to terminal closing/becoming inaccessible
+				exitWithRuntime(rt, 0)
+			}
+			return
+		}
+
+		if event != nil {
+			_, resize := event.(*tcell.EventResize)
+			if resize {
+				action.InfoBar.HandleEvent(event)
+				action.Tabs.HandleEvent(event)
+			} else if action.InfoBar.HasPrompt {
+				action.InfoBar.HandleEvent(event)
+			} else {
+				action.Tabs.HandleEvent(event)
+			}
+		}
+
+		err := config.RunPluginFn("onAnyEvent")
+		if err != nil {
+			screen.TermMessage(err)
+		}
+	}()
 }
