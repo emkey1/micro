@@ -46,29 +46,32 @@ var (
 )
 
 type pscalRuntimeState struct {
-	sessionID       uint64
-	sighup          chan os.Signal
-	sigterm         chan os.Signal
-	eventPollStop   chan struct{}
-	eventPollDone   chan struct{}
-	resizeWatchStop chan struct{}
-	resizeWatchDone chan struct{}
-	embeddedMode    bool
-	lastResizeCols  int
-	lastResizeRows  int
-	screen          tcell.Screen
-	events          chan tcell.Event
-	drawChan        chan bool
-	timer           chan func()
-	jobs            chan shell.JobFunction
-	closeTerms      chan bool
-	tabs            *action.TabList
-	infoBar         *action.InfoPane
-	logBufPane      *action.BufPane
-	openBuffers     []*buffer.Buffer
-	logBuf          *buffer.Buffer
-	tcellInFD       int
-	tcellOutFD      int
+	sessionID        uint64
+	sighup           chan os.Signal
+	sigterm          chan os.Signal
+	eventPollStop    chan struct{}
+	eventPollDone    chan struct{}
+	resizeWatchStop  chan struct{}
+	resizeWatchDone  chan struct{}
+	embeddedMode     bool
+	lastResizeCols   int
+	lastResizeRows   int
+	screen           tcell.Screen
+	events           chan tcell.Event
+	drawChan         chan bool
+	timer            chan func()
+	jobs             chan shell.JobFunction
+	closeTerms       chan bool
+	tabs             *action.TabList
+	infoBar          *action.InfoPane
+	logBufPane       *action.BufPane
+	openBuffers      []*buffer.Buffer
+	logBuf           *buffer.Buffer
+	globalSettings   map[string]any
+	volatileSettings map[string]bool
+	modifiedSettings map[string]bool
+	tcellInFD        int
+	tcellOutFD       int
 }
 
 var pscalScreenBindMu sync.Mutex
@@ -99,6 +102,15 @@ func pscalBindRuntimeStateLocked(rt *pscalRuntimeState) {
 	if rt.closeTerms != nil {
 		shell.CloseTerms = rt.closeTerms
 	}
+	if rt.globalSettings != nil {
+		config.GlobalSettings = rt.globalSettings
+	}
+	if rt.volatileSettings != nil {
+		config.VolatileSettings = rt.volatileSettings
+	}
+	if rt.modifiedSettings != nil {
+		config.ModifiedSettings = rt.modifiedSettings
+	}
 	if rt.sigterm != nil {
 		util.Sigterm = rt.sigterm
 	}
@@ -123,6 +135,9 @@ func pscalCaptureRuntimeStateLocked(rt *pscalRuntimeState) {
 	rt.logBufPane = action.LogBufPane
 	rt.openBuffers = buffer.OpenBuffers
 	rt.logBuf = buffer.LogBuf
+	rt.globalSettings = config.GlobalSettings
+	rt.volatileSettings = config.VolatileSettings
+	rt.modifiedSettings = config.ModifiedSettings
 	rt.timer = timerChan
 	rt.jobs = shell.Jobs
 	rt.closeTerms = shell.CloseTerms
@@ -634,6 +649,20 @@ func pscalMicroMain(rt *pscalRuntimeState) {
 	if err != nil {
 		screen.TermMessage(err)
 	}
+
+	// Startup mutates process-global config/action state. Serialize this phase
+	// so each embedded runtime captures its own isolated state snapshot.
+	pscalScreenBindMu.Lock()
+	startupLocked := true
+	unlockStartup := func() {
+		if startupLocked {
+			pscalCaptureRuntimeStateLocked(rt)
+			pscalScreenBindMu.Unlock()
+			startupLocked = false
+		}
+	}
+	defer unlockStartup()
+
 	err = config.InitGlobalSettings()
 	if err != nil {
 		screen.TermMessage(err)
@@ -658,9 +687,11 @@ func pscalMicroMain(rt *pscalRuntimeState) {
 
 	DoPluginFlags()
 
-	restoreTcellProvider := pscalInstallTcellStdioProvider(rt)
-	defer restoreTcellProvider()
-	err = screen.Init()
+	func() {
+		restoreTcellProvider := pscalInstallTcellStdioProvider(rt)
+		defer restoreTcellProvider()
+		err = screen.Init()
+	}()
 	if err != nil {
 		fmt.Println(err)
 		fmt.Println("Fatal: Micro could not initialize a Screen.")
@@ -737,11 +768,6 @@ func pscalMicroMain(rt *pscalRuntimeState) {
 	}
 
 	action.InitTabs(b)
-	func() {
-		pscalScreenBindMu.Lock()
-		defer pscalScreenBindMu.Unlock()
-		pscalCaptureRuntimeStateLocked(rt)
-	}()
 
 	err = config.RunPluginFn("init")
 	if err != nil {
@@ -795,6 +821,9 @@ func pscalMicroMain(rt *pscalRuntimeState) {
 	rt.eventPollStop = pollStop
 	rt.eventPollDone = pollDone
 
+	// Release startup lock after capturing final per-runtime references.
+	unlockStartup()
+
 	// Here is the event loop which runs in a separate thread
 	go func(scr tcell.Screen, events chan tcell.Event, stop <-chan struct{}, done chan<- struct{}) {
 		defer close(done)
@@ -846,10 +875,11 @@ func pscalMicroMain(rt *pscalRuntimeState) {
 		<-rt.drawChan
 	}
 
-	// In embedded/iOS mode we may run over stdio relays where terminal-driven
-	// resize events are unreliable. Seed an explicit initial resize from
-	// COLUMNS/LINES when available.
-	pscalPostResizeFromEnv(rt, true)
+	// In embedded mode, resize is delivered per-session by the host bridge.
+	// Only seed from env when explicit env polling is enabled for diagnostics.
+	if pscalEnvResizePollingEnabled(rt) {
+		pscalPostResizeFromEnv(rt, true)
+	}
 	pscalStartResizeWatcher(rt, rt.screen)
 
 	// wait for initial resize event
