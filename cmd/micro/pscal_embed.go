@@ -4,8 +4,22 @@ package main
 
 /*
 #include <stdint.h>
-uint64_t pscal_micro_current_session_id(void);
-int pscal_micro_current_stdio_fds(int *stdin_fd, int *stdout_fd);
+
+__attribute__((weak))
+uint64_t pscal_micro_current_session_id(void) {
+	return 0;
+}
+
+__attribute__((weak))
+int pscal_micro_current_stdio_fds(int *stdin_fd, int *stdout_fd) {
+	if (stdin_fd) {
+		*stdin_fd = -1;
+	}
+	if (stdout_fd) {
+		*stdout_fd = -1;
+	}
+	return 0;
+}
 */
 import "C"
 
@@ -107,6 +121,10 @@ func pscalPostRuntimeResize(sessionID uint64, cols, rows int) bool {
 	defer func() {
 		_ = recover()
 	}()
+	if applier, ok := rt.screen.(interface{ PSCALApplyResize(int, int) }); ok {
+		applier.PSCALApplyResize(cols, rows)
+		return true
+	}
 	return rt.screen.PostEvent(tcell.NewEventResize(cols, rows)) == nil
 }
 
